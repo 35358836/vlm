@@ -1,0 +1,30 @@
+{
+    "vlm":{
+        "vision_encoder":{
+            "name": "neurovfm",
+            "args":{
+                "model_config_path": "/hpc/jtia475/model_weights/neurovfm/config.json",
+                "model_weight_path": "/hpc/jtia475/model_weights/neurovfm/pytorch_model.bin"
+            }
+        },
+        "text_decoder":{
+            "name": "Qwen3-0.6B",
+            "args":{
+                "model_dir": "/hpc/jtia475/model_weights/Qwen3-0.6B",
+                "image_token": "<|image_pad|>",
+                "system_prompt": "You are a helpful medical imaging assistant. Think step by step before answering.",
+                "lora_config": {
+                    "r": 16,
+                    "lora_alpha":32,
+                    "target_modules":[
+                        "q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"
+                    ],
+                    "lora_dropout":0.05,
+                    "bias":"none",
+                    "task_type":"CAUSAL_LM"
+                }
+            }
+        }
+    }
+}
