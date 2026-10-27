@@ -23,11 +23,12 @@ class Qwen3(TextDecoder):
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(model_dir,trust_remote_code=True)
 
-        # lora
+        # lora:注入 LoRA 层后拆掉 PEFT 外壳,使 self.model 恒为裸 Qwen3ForCausalLM
+        # (get_text_embed/forward 依赖 embed_tokens、model、lm_head 等裸模型属性路径)
         if lora_config is not None:
-            lora_config = LoraConfig(**lora_config)
-            self.model = get_peft_model(self.model, lora_config)
-            self.model.print_trainable_parameters()
+            peft_model = get_peft_model(self.model, LoraConfig(**lora_config))
+            peft_model.print_trainable_parameters()
+            self.model = peft_model.base_model.model
 
     def get_text_embed(self, input_ids):
         """文本embedding"""

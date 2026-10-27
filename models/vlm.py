@@ -112,6 +112,44 @@ class VLM(nn.Module):
             v_mask = None
         return self.projector(feats, v_mask)
 
+    # ================================== 冻结/解冻参数 ==================================
+    def freeze(self, module:str = None):
+        """冻结参数"""
+        if module == "vision_encoder":
+            # 冻结视觉编码器
+            for p in self.vision_encoder.parameters():
+                p.requires_grad = False
+        elif module == "projector":
+            # 冻结连接器
+            for p in self.projector.parameters():
+                p.requires_grad = False
+        elif module == "text_decoder":
+            # 冻结文本解码器
+            for p in self.text_decoder.parameters():
+                p.requires_grad = False
+        elif module is None:
+            # 全部冻结
+            for p in self.parameters():
+                p.requires_grad = False
+
+    def unfreeze(self, module:str = None):
+        """解冻参数"""
+        if module == "vision_encoder":
+            # 解冻视觉编码器
+            for p in self.vision_encoder.parameters():
+                p.requires_grad = True
+        elif module == "projector":
+            # 解冻连接器
+            for p in self.projector.parameters():
+                p.requires_grad = True
+        elif module == "text_decoder":
+            # 解冻文本解码器
+            for p in self.text_decoder.parameters():
+                p.requires_grad = True
+        elif module is None:
+            # 全部解冻
+            for p in self.parameters():
+                p.requires_grad = True
     # ================================== 前向计算逻辑 ==================================
     def forward(self, img, prompt=None, target=None):
         """
