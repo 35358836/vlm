@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, Subset
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from vlm_train.models.vlm import VLM, VlmConfig
-from vlm_train.data.dataset import MyDataset
+from vlm_train.data.dataset import MyDataset, VisionBatch
 from vlm_train.utils import json_load, json_dump
 
 CONFIG_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs", "test.json")
@@ -36,7 +36,6 @@ class TrainingConfig(BaseModel):
     """configs 中 "training" 字段"""
     # 数据
     data_path: str               # 样本 JSON(MyDataset 直接读取)
-    target_shape: tuple[int, int, int] = (48, 224, 224)  # 统一体数据尺寸(需被 patch 整除)
     val_ratio: float = 0.1       # 验证集占比(随机划分,只训不测)
     num_workers: int = 4
     seed: int = 42
@@ -111,28 +110,26 @@ def build_model(vlm_cfg: dict, device: torch.device, logger) -> VLM:
     return model
 
 
-def make_collate(target_shape):
-    """构造 collate:把每例体数据统一到固定 (D,H,W)——超出中心裁剪,不足零填充。
-    (样本重采样后尺寸不一;后续数据侧统一 resize 后此处自然直通)"""
-    td, th, tw = target_shape
-
-    def center_span(src: int, dst: int):
-        """(目标起点, 源起点, 长度):把长度 src 的轴居中放入长度 dst 的轴"""
-        if src >= dst:
-            return 0, (src - dst) // 2, dst
-        return (dst - src) // 2, 0, src
-
+def make_collate():
+    """构造 collate:变长 tokens/coords 右侧零填充对齐为 batch,并给出有效位 mask"""
     def collate(batch):
-        imgs, prompts, targets = zip(*batch)
-        out = torch.zeros(len(imgs), imgs[0].shape[0], td, th, tw)
-        for i, im in enumerate(imgs):
-            (dz, sz, nz), (dh, sh, nh), (dw, sw, nw) = (
-                center_span(s, d) for s, d in zip(im.shape[-3:], (td, th, tw)))
-            out[i, ..., dz:dz + nz, dh:dh + nh, dw:dw + nw] = \
-                im[..., sz:sz + nz, sh:sh + nh, sw:sw + nw]
-        return out, list(prompts), list(targets)
+        tokens_list, coords_list, prompts, targets = zip(*batch)
+        B, n_max = len(tokens_list), max(t.shape[0] for t in tokens_list)
+        tokens = torch.zeros(B, n_max, tokens_list[0].shape[1])
+        coords = torch.zeros(B, n_max, 3, dtype=torch.long)
+        mask = torch.zeros(B, n_max, dtype=torch.bool)
+        for i, (t, c) in enumerate(zip(tokens_list, coords_list)):
+            tokens[i, :t.shape[0]] = t
+            coords[i, :c.shape[0]] = c
+            mask[i, :t.shape[0]] = True
+        return VisionBatch(tokens, coords, mask), list(prompts), list(targets)
 
     return collate
+
+
+def to_device(img, device):
+    """视觉 batch(tokens/coords/mask)整体搬至 device"""
+    return VisionBatch(*(t.to(device, non_blocking=True) for t in img))
 
 
 def make_loaders(cfg: TrainingConfig, logger):
@@ -142,7 +139,7 @@ def make_loaders(cfg: TrainingConfig, logger):
     perm = torch.randperm(len(dataset),
                           generator=torch.Generator().manual_seed(cfg.seed)).tolist()
     train_set, val_set = Subset(dataset, perm[n_val:]), Subset(dataset, perm[:n_val])
-    collate = make_collate(cfg.target_shape)
+    collate = make_collate()
     loader_kwargs = dict(num_workers=cfg.num_workers, pin_memory=True,
                          persistent_workers=cfg.num_workers > 0, collate_fn=collate)
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True,
@@ -150,7 +147,7 @@ def make_loaders(cfg: TrainingConfig, logger):
                               **loader_kwargs)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, **loader_kwargs)
     logger.info(f"数据 {cfg.data_path} | 训练 {len(train_set)} | 验证 {len(val_set)} | "
-                f"统一尺寸 {tuple(cfg.target_shape)}")
+                f"变长视觉 token(背景已去除)")
     return train_loader, val_loader
 
 
@@ -203,7 +200,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, trainable_param
     model.train()
     loss_sum, n_steps, t0 = 0.0, 0, time.time()
     for i, (img, prompt, target) in enumerate(loader):
-        img = img.to(device, non_blocking=True)
+        img = to_device(img, device)
         with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
             _, loss = model(img, prompt=prompt, target=target)
         if not torch.isfinite(loss):
@@ -232,7 +229,7 @@ def validate(model, loader, device, use_amp, cfg, logger) -> float:
     model.eval()
     loss_sum, n_samples = 0.0, 0
     for img, prompt, target in loader:
-        img = img.to(device, non_blocking=True)
+        img = to_device(img, device)
         with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
             _, loss = model(img, prompt=prompt, target=target)
         if torch.isfinite(loss):
@@ -245,7 +242,8 @@ def validate(model, loader, device, use_amp, cfg, logger) -> float:
     k = min(cfg.num_val_generate, len(loader.dataset))
     if k > 0:
         img, prompt, target = next(iter(loader))
-        gen = model.generate(img[:k].to(device), prompt=prompt[:k], max_new_tokens=96)
+        sub = VisionBatch(img.tokens[:k], img.coords[:k], img.mask[:k])  # 前 k 个样本
+        gen = model.generate(to_device(sub, device), prompt=prompt[:k], max_new_tokens=96)
         for pr, g, t in zip(prompt[:k], gen, target[:k]):
             logger.info(f"  [问] {pr}")
             logger.info(f"  [生成] {g[:200]}")
@@ -274,9 +272,6 @@ def main():
     # ---------- 2. 模型与数据 ----------
     model = build_model(cfg_dict["vlm"], device, logger)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    patch = getattr(model.vision_encoder, "patch_size", (4, 16, 16))
-    assert all(t % p == 0 for t, p in zip(cfg.target_shape, patch)), \
-        f"target_shape {tuple(cfg.target_shape)} 需被视觉编码器 patch {tuple(patch)} 各轴整除"
     train_loader, val_loader = make_loaders(cfg, logger)
 
     # ---------- 3. 优化器 / 调度器 / AMP ----------

@@ -11,7 +11,6 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange
 from torch.nn.init import trunc_normal_
 from torchvision.ops import StochasticDepth
 from torch.utils.checkpoint import checkpoint
@@ -871,46 +870,30 @@ class NeurovfmVisionEncoder(VisionEncoder):
         self.out_dim = config["params"]["embed_dim"]
         self.patch_size = (4, 16, 16)
 
-    def tokenize_volume(self, x):
-        B, C, D, H, W = x.shape
-        pd, ph, pw = self.patch_size
-        assert D % pd == 0 and H % ph == 0 and W % pw == 0
-        n_patches_d, n_patches_h, n_patches_w = D // pd, H // ph, W // pw
-
-        tokens_torch = rearrange(
-            x,
-            "b c (d pd) (h ph) (w pw) -> b (d h w) (c pd ph pw)",
-            d=n_patches_d, h=n_patches_h, w=n_patches_w,
-            pd=pd, ph=ph, pw=pw)
-
-        coords_d, coords_h, coords_w = torch.meshgrid(
-            torch.arange(n_patches_d), torch.arange(n_patches_h),
-            torch.arange(n_patches_w), indexing='ij')
-        coords_torch = torch.stack(
-            [coords_d.flatten(), coords_h.flatten(), coords_w.flatten()],
-            dim=1).long().to(x.device)
-        return tokens_torch, coords_torch
-
     def forward(self, images):
-        tokens_torch, coords_torch = self.tokenize_volume(images)
-        B, N, _ = tokens_torch.shape
+        """images: VisionBatch(tokens (B,N,patch_feat) / coords (B,N,3) / mask (B,N),
+        已右侧零填充;背景 token 在数据侧去除,各样本不等长)。
+        拼接有效 token 为 packed 序列过 ViT(varlen 注意力样本间互不串扰),
+        再散回 padded 布局;返回 (feats (B,N,out_dim), mask)。"""
+        tokens, coords, mask = images
+        B, N = mask.shape
 
-        mean, std = 0.3141, 0.2623
-        tokens_torch = (tokens_torch - mean) / std
+        mean, std = 0.3141, 0.2623  # 官方 token 归一化常数
+        tokens_flat = (tokens[mask] - mean) / std  # (total, patch_feat) 拼接
+        coords_flat = coords[mask]                 # (total, 3)
 
-        tokens_flat = tokens_torch.reshape(B * N, -1)
-        coords_flat = coords_torch.repeat(B, 1)
-
-        cu_seqlens = torch.arange(0, (B + 1) * N, step=N,
-                                  dtype=torch.int32, device=images.device)
-        max_seqlen = N
+        seq_lens = mask.sum(1)
+        cu_seqlens = torch.zeros(B + 1, dtype=torch.int32, device=tokens.device)
+        cu_seqlens[1:] = seq_lens.cumsum(0)
 
         embs = self.model(
             tokens_flat, coords_flat,
-            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+            cu_seqlens=cu_seqlens, max_seqlen=int(seq_lens.max()),
             use_flash_attn=False,
         )
-        return embs.reshape(B, N, -1)
+        feats = tokens.new_zeros(B, N, embs.shape[-1])
+        feats[mask] = embs.to(feats.dtype)  # AMP 下 embs 为 fp16,显式转回
+        return feats, mask
 
 
 # ============================================================
