@@ -5,7 +5,8 @@
   2. 建数据(按 val_ratio 划分训练/验证集)与模型(冻结基座)
   3. 两阶段:前 stage1_epochs 轮冻结 LoRA 只训 projector(视觉冷启动),
      之后解冻 LoRA 联合微调;两阶段各有独立的 warmup+余弦调度
-  4. 逐轮:训练 → 验证 → val 下降则保存最优参数 → 保存训练现场(供续训)
+  4. 逐轮:训练 → 验证(loss + 生成样例 + 视觉依赖度) → val 下降则保存最优参数
+     → 保存训练现场(供续训)
   5. val 连续 patience 轮不下降则早停(切换阶段时计数重置);
      projector.pt / lora.pt 始终为最优参数
 
@@ -59,6 +60,7 @@ class TrainingConfig(BaseModel):
     output_dir: str
     log_steps: int = 10
     num_val_generate: int = 2    # 每轮验证后打印的生成样例数,0 关闭
+    num_val_shuffle: int = 32    # 每轮验证计算视觉依赖度(图文错配差值)的样本数,0 关闭
     # 续训
     resume: bool = False         # 从 output_dir/checkpoint.pt 恢复现场继续训练
 
@@ -256,10 +258,15 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, trainable_param
 
 @torch.no_grad()
 def validate(model, loader, device, use_amp, cfg, logger) -> float:
-    """验证集平均 loss,并生成少量样例观察效果"""
+    """验证集平均 loss,并生成少量样例观察效果,同时监控视觉依赖度"""
     model.eval()
     loss_sum, n_samples = 0.0, 0
+    raw = []  # (tokens, coords, prompt, target) 原始样本,用于视觉依赖度
     for img, prompt, target in loader:
+        if len(raw) < cfg.num_val_shuffle:  # 收集前 K 个样本(去填充)
+            for i in range(min(img.size(0), cfg.num_val_shuffle - len(raw))):
+                m = img.mask[i]
+                raw.append((img.tokens[i][m], img.coords[i][m], prompt[i], target[i]))
         img = to_device(img, device)
         with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
             _, loss = model(img, prompt=prompt, target=target)
@@ -279,6 +286,30 @@ def validate(model, loader, device, use_amp, cfg, logger) -> float:
             logger.info(f"  [问] {pr}")
             logger.info(f"  [生成] {g[:200]}")
             logger.info(f"  [目标] {t[:200]}")
+
+    # 视觉依赖度:前 K 个样本真配对 vs 图文错配(文本 i 配图 i+1)的 loss 差
+    if cfg.num_val_shuffle > 1 and len(raw) > 1:
+        n = len(raw)
+        rolled = [(raw[(i + 1) % n][0], raw[(i + 1) % n][1], raw[i][2], raw[i][3])
+                  for i in range(n)]
+        collate = make_collate()
+
+        def subset_loss(sample_list):
+            s, n_seen = 0.0, 0
+            for j in range(0, len(sample_list), cfg.batch_size):
+                img, prompt, target = collate(sample_list[j:j + cfg.batch_size])
+                img = to_device(img, device)
+                with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
+                    _, loss = model(img, prompt=prompt, target=target)
+                if torch.isfinite(loss):
+                    s += loss.item() * img.size(0)
+                    n_seen += img.size(0)
+            return s / n_seen if n_seen else float("inf")
+
+        true_l, roll_l = subset_loss(raw), subset_loss(rolled)
+        if math.isfinite(true_l) and true_l > 0:
+            logger.info(f"视觉依赖 | 真配对 {true_l:.4f} | 错配 {roll_l:.4f} | "
+                        f"差值 {roll_l - true_l:+.4f}({(roll_l / true_l - 1) * 100:+.1f}%)")
     return val_loss
 
 

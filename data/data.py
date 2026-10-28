@@ -212,14 +212,14 @@ def load_image(path, preprocess=True):
     
     # Apply preprocessing if requested
     if preprocess:
-        print(f"Applying standardized preprocessing...")
+        # print(f"Applying standardized preprocessing...")
         try:
             img_sitk = preprocess_image(img_sitk)
         except Exception as e:
             print(f"Error during preprocessing: {e}")
             return None
     
-    print(f"Successfully loaded image: shape={img_sitk.GetSize()}, spacing={img_sitk.GetSpacing()}")
+    # print(f"Successfully loaded image: shape={img_sitk.GetSize()}, spacing={img_sitk.GetSpacing()}")
     return img_sitk
 
 def prepare_for_inference(img_sitk, mode, z_dim=None):

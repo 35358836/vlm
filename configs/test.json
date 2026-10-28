@@ -30,21 +30,22 @@
     "training":{
         "data_path": "/hpc/jtia475/datasets/mytest/data_set.json",
         "output_dir": "/hpc/jtia475/vlm_train/outputs/test",
-        "num_epochs": 100,
-        "patience": 10,
+        "num_epochs": 25,
+        "patience": 5,
         "batch_size": 2,
-        "lr": 0.0002,
+        "lr": 5e-5,
         "weight_decay": 0.01,
         "warmup_ratio": 0.03,
         "grad_clip": 1.0,
         "amp": true,
-        "stage1_epochs": 5,
+        "stage1_epochs": 15,
         "stage1_lr": 1e-4,
         "val_ratio": 0.1,
         "num_workers": 4,
         "seed": 42,
         "log_steps": 10,
         "num_val_generate": 2,
+        "num_val_shuffle": 32,
         "resume": false
     }
 }
