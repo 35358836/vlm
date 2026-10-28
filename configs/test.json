@@ -30,7 +30,6 @@
     "training":{
         "data_path": "/hpc/jtia475/datasets/mytest/data_set.json",
         "output_dir": "/hpc/jtia475/vlm_train/outputs/test",
-        "target_shape": [48, 224, 224],
         "num_epochs": 100,
         "patience": 10,
         "batch_size": 2,
@@ -39,6 +38,8 @@
         "warmup_ratio": 0.03,
         "grad_clip": 1.0,
         "amp": true,
+        "stage1_epochs": 5,
+        "stage1_lr": 1e-4,
         "val_ratio": 0.1,
         "num_workers": 4,
         "seed": 42,

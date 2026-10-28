@@ -3,8 +3,11 @@
 流程:
   1. 读配置("vlm" 建模型,"training" 配训练),自动创建输出目录
   2. 建数据(按 val_ratio 划分训练/验证集)与模型(冻结基座)
-  3. 逐轮:训练 → 验证 → val 下降则保存最优参数 → 保存训练现场(供续训)
-  4. val 连续 patience 轮不下降则早停;projector.pt / lora.pt 始终为最优参数
+  3. 两阶段:前 stage1_epochs 轮冻结 LoRA 只训 projector(视觉冷启动),
+     之后解冻 LoRA 联合微调;两阶段各有独立的 warmup+余弦调度
+  4. 逐轮:训练 → 验证 → val 下降则保存最优参数 → 保存训练现场(供续训)
+  5. val 连续 patience 轮不下降则早停(切换阶段时计数重置);
+     projector.pt / lora.pt 始终为最优参数
 
 用法: python train.py [--config configs/test.json] [--device cuda]
 """
@@ -42,11 +45,14 @@ class TrainingConfig(BaseModel):
     # 优化
     num_epochs: int = 5
     batch_size: int = 2
-    lr: float = 2e-4             # projector 与 LoRA 共用
+    lr: float = 2e-4             # 阶段二(projector + LoRA 联合)学习率
     weight_decay: float = 0.01
-    warmup_ratio: float = 0.03   # warmup 步数 / 总步数
+    warmup_ratio: float = 0.03   # warmup 步数 / 所处阶段总步数
     grad_clip: float = 1.0
     amp: bool = True             # fp16 混合精度(V100 无 bf16 张量核心)
+    # 两阶段:阶段一冻结 LoRA 只训 projector(视觉冷启动),阶段二解冻联合微调
+    stage1_epochs: int = 5       # 阶段一轮数(计入 num_epochs),0 = 不分阶段
+    stage1_lr: float = 1e-4      # 阶段一学习率
     # 早停
     patience: int = 3            # val 连续 N 轮不下降则早停,0 关闭
     # 输出(output_dir 下:train.log、checkpoint.pt(续训现场)、projector.pt + lora.pt(最优参数))
@@ -161,16 +167,42 @@ def build_scheduler(optimizer, warmup_steps: int, total_steps: int):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def stage_of(epoch: int, cfg: TrainingConfig) -> int:
+    """epoch 所处训练阶段:1 = 仅 projector,2 = projector + LoRA"""
+    return 1 if epoch <= cfg.stage1_epochs else 2
+
+
+def enter_stage(model, stage, cfg: TrainingConfig, steps_per_epoch: int, logger):
+    """进入指定阶段:阶段一冻结 LoRA(只训 projector),阶段二解冻联合;
+    按该阶段轮数与学习率重建优化器/调度器。返回 (optimizer, scheduler, trainable_params)"""
+    for name, p in model.text_decoder.named_parameters():
+        if "lora_" in name:
+            p.requires_grad = stage == 2
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    lr = cfg.stage1_lr if stage == 1 else cfg.lr
+    n_epochs = cfg.stage1_epochs if stage == 1 else cfg.num_epochs - cfg.stage1_epochs
+    total_steps = steps_per_epoch * n_epochs
+    warmup_steps = int(total_steps * cfg.warmup_ratio)
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=cfg.weight_decay)
+    scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+    n_train = sum(p.numel() for p in trainable_params) / 1e6
+    logger.info(f"阶段 {stage}({'仅 projector' if stage == 1 else 'projector + LoRA 联合'}) | "
+                f"lr {lr:.2e} | 可训练 {n_train:.2f}M | "
+                f"总步数 {total_steps}(warmup {warmup_steps})")
+    return optimizer, scheduler, trainable_params
+
+
 # ================================== 存档 / 续训 ==================================
 def lora_state(model: VLM) -> dict:
     """文本解码器中已注入的 LoRA 参数"""
     return {k: v for k, v in model.text_decoder.model.state_dict().items() if "lora_" in k}
 
 
-def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, global_step, best):
+def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, global_step, best, stage):
     """训练现场 = 可训练参数(projector + LoRA)+ 优化器/调度器/AMP/RNG/早停状态"""
     torch.save({
-        "epoch": epoch, "global_step": global_step, "best": best,
+        "epoch": epoch, "global_step": global_step, "stage": stage, "best": best,
         "projector": model.projector.state_dict(), "lora": lora_state(model),
         "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -178,20 +210,19 @@ def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, global_ste
     }, path)
 
 
-def load_checkpoint(path, model, optimizer, scheduler, scaler):
-    """恢复训练现场,返回 (start_epoch, global_step, best)"""
+def load_checkpoint(path, model, scaler):
+    """恢复模型权重/AMP/RNG/早停状态,返回 (start_epoch, global_step, best, ckpt)。
+    优化器/调度器与阶段绑定,由 main 进入对应阶段时再决定是否载入。"""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.projector.load_state_dict(ckpt["projector"])
     model.text_decoder.model.load_state_dict(ckpt["lora"], strict=False)
-    optimizer.load_state_dict(ckpt["optimizer"])
-    scheduler.load_state_dict(ckpt["scheduler"])
     scaler.load_state_dict(ckpt["scaler"])
     torch_rng, py_rng, np_rng = ckpt["rng"]
     torch.set_rng_state(torch_rng)
     random.setstate(py_rng)
     np.random.set_state(np_rng)
     best = ckpt.get("best", {"best_val": float("inf"), "best_epoch": 0, "no_improve": 0})
-    return ckpt["epoch"] + 1, ckpt["global_step"], best
+    return ckpt["epoch"] + 1, ckpt["global_step"], best, ckpt
 
 
 # ================================== 训练 / 验证 ==================================
@@ -271,34 +302,40 @@ def main():
 
     # ---------- 2. 模型与数据 ----------
     model = build_model(cfg_dict["vlm"], device, logger)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
     train_loader, val_loader = make_loaders(cfg, logger)
 
-    # ---------- 3. 优化器 / 调度器 / AMP ----------
-    optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    total_steps = len(train_loader) * cfg.num_epochs
-    warmup_steps = int(total_steps * cfg.warmup_ratio)
-    scheduler = build_scheduler(optimizer, warmup_steps, total_steps)
+    # ---------- 3. AMP 与续训恢复(先于优化器:当前阶段由起始轮决定) ----------
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
-    logger.info(f"优化器 AdamW | 总步数 {total_steps}(warmup {warmup_steps})")
-
-    # ---------- 4. 续训恢复 ----------
     ckpt_path = os.path.join(cfg.output_dir, "checkpoint.pt")
     proj_path = os.path.join(cfg.output_dir, "projector.pt")
     lora_path = os.path.join(cfg.output_dir, "lora.pt")
-    start_epoch, global_step = 1, 0
+    start_epoch, global_step, ckpt = 1, 0, None
     best = {"best_val": float("inf"), "best_epoch": 0, "no_improve": 0}
     if cfg.resume:
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(f"resume=true 但不存在 {ckpt_path};全新训练请置 resume=false")
-        start_epoch, global_step, best = load_checkpoint(ckpt_path, model, optimizer, scheduler, scaler)
+        start_epoch, global_step, best, ckpt = load_checkpoint(ckpt_path, model, scaler)
         logger.info(f"已从 checkpoint 恢复现场: 从 epoch {start_epoch} / step {global_step} 继续 | "
                     f"历史最优 val {best['best_val']:.4f}(epoch {best['best_epoch']})")
     elif os.path.exists(ckpt_path):
         logger.info("注意: 目录下已有 checkpoint.pt,本次全新训练将覆盖它")
 
-    # ---------- 5. 逐轮:训练 → 验证 → 存档 ----------
+    # ---------- 4. 逐轮:训练 → 验证 → 存档(两阶段) ----------
+    optimizer = scheduler = trainable_params = cur_stage = None
     for epoch in range(start_epoch, cfg.num_epochs + 1):
+        stage = stage_of(epoch, cfg)
+        if stage != cur_stage:  # 首轮或阶段切换:冻结/解冻 LoRA 并重建优化器
+            if epoch > start_epoch:  # 运行途中切换(非本次起始轮)
+                best["no_improve"] = 0  # 新阶段新起点,早停计数重新起算
+                logger.info(f"=== 切换到阶段 {stage},早停计数重置 ===")
+            optimizer, scheduler, trainable_params = enter_stage(
+                model, stage, cfg, len(train_loader), logger)
+            if ckpt is not None and ckpt.get("stage", 1) == stage:
+                optimizer.load_state_dict(ckpt["optimizer"])
+                scheduler.load_state_dict(ckpt["scheduler"])
+                logger.info("已载入 checkpoint 中本阶段的优化器/调度器状态")
+            cur_stage, ckpt = stage, None
+
         t0 = time.time()
         train_loss, global_step = train_one_epoch(
             model, train_loader, optimizer, scheduler, scaler, trainable_params,
@@ -315,7 +352,7 @@ def main():
             best["no_improve"] += 1
 
         save_checkpoint(ckpt_path, model, optimizer, scheduler, scaler,
-                        epoch, global_step, best)
+                        epoch, global_step, best, stage)
         logger.info(f"epoch {epoch} 完成 | train {train_loss:.4f} | val {val_loss:.4f} | "
                     f"最优 val {best['best_val']:.4f}(epoch {best['best_epoch']}) | "
                     f"耗时 {(time.time() - t0) / 60:.1f} min | 现场已保存")
@@ -323,7 +360,7 @@ def main():
             logger.info(f"val 连续 {best['no_improve']} 轮未下降,早停(patience={cfg.patience})")
             break
 
-    # ---------- 6. 结束 ----------
+    # ---------- 5. 结束 ----------
     logger.info(f"训练结束 | 最优 val {best['best_val']:.4f}(epoch {best['best_epoch']})| "
                 f"参数 {proj_path} 与 {lora_path}")
 
